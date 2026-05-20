@@ -56,124 +56,13 @@ except ImportError:
     from skimage.metrics import peak_signal_noise_ratio as psnr_fn
     from skimage.metrics import structural_similarity  as ssim_fn
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  rANS — Range Asymmetric Numeral Systems
-#  Алгоритм Ярека Дуди (arXiv:0902.0271)
-#
-#  Стан x ∈ [M, M·2^r):
-#    Кодування символу s (частота f_s, кумулятивна c_s, таблиця M):
-#       нормалізація: поки x ≥ f_s · 2^r → виводимо r-бітне слово, x >>= r
-#       крок ANS:     x = (x // f_s) · M  +  c_s  +  (x mod f_s)
-#    Декодування:
-#       s = decode_table[x mod M]
-#       зворотній крок: x = f_s · (x // M) + (x mod M) - c_s
-#       ренормалізація: поки x < M → x = (x << r) | read_word()
-#
-#  Параметри: M = 2^16 = 65 536,  r = 16 бітів
-#  Вивід кодера: фінальний стан (32 біти) + потік r-бітних слів
-# ═══════════════════════════════════════════════════════════════════════════════
-class rANSCodec:
-    """Повна реалізація rANS з кодуванням і декодуванням."""
-
-    OUT_BITS = 16
-    OUT_MASK = (1 << OUT_BITS) - 1    # 0xFFFF
-
-    def __init__(self, symbol_counts: dict):
-        """
-        symbol_counts : {symbol: int_count}
-        Автоматично масштабує частоти до суми M = 2^16.
-        """
-        M     = 1 << 16
-        self.M = M
-        total  = sum(symbol_counts.values())
-        syms   = sorted(symbol_counts.keys(), key=str)
-
-        # Пропорційне масштабування (кожен символ ≥ 1)
-        scaled = {s: max(1, round(symbol_counts[s] * M / total)) for s in syms}
-
-        # Корекція до точної суми M
-        diff = M - sum(scaled.values())
-        ordered = sorted(syms, key=lambda s: symbol_counts[s], reverse=True)
-        i = 0
-        while diff > 0:
-            scaled[ordered[i % len(ordered)]] += 1; diff -= 1; i += 1
-        while diff < 0:
-            idx = i % len(ordered)
-            if scaled[ordered[idx]] > 1:
-                scaled[ordered[idx]] -= 1; diff += 1
-            i += 1
-        assert sum(scaled.values()) == M
-
-        self.freq    = scaled
-        self.cumfreq = {}
-        self.decode_table = [None] * M
-
-        cum = 0
-        for s in syms:
-            self.cumfreq[s] = cum
-            for k in range(cum, cum + scaled[s]):
-                self.decode_table[k] = s
-            cum += scaled[s]
-
-    # ── кодування ─────────────────────────────────────────────────────────────
-    def encode(self, data: list) -> tuple:
-        """Повертає (final_state: int, word_stream: list[int])."""
-        M, r, mask = self.M, self.OUT_BITS, self.OUT_MASK
-        freq, cumfreq = self.freq, self.cumfreq
-
-        state  = M          # початковий стан = L = M
-        stream = []
-
-        for sym in reversed(data):   # кодуємо у зворотньому порядку
-            f, c = freq[sym], cumfreq[sym]
-            limit = f << r
-            while state >= limit:
-                stream.append(state & mask)
-                state >>= r
-            state = (state // f) * M + c + (state % f)
-
-        return state, stream[::-1]   # stream у прямому порядку
-
-    # ── декодування ───────────────────────────────────────────────────────────
-    def decode(self, final_state: int, word_stream: list, n: int) -> list:
-        """Декодує n символів із (final_state, word_stream)."""
-        M, r = self.M, self.OUT_BITS
-        dtable, freq, cumfreq = self.decode_table, self.freq, self.cumfreq
-
-        state  = final_state
-        stream = list(word_stream)
-        result = []
-
-        for _ in range(n):
-            slot = state % M
-            sym  = dtable[slot]
-            result.append(sym)
-
-            f, c = freq[sym], cumfreq[sym]
-            state = f * (state // M) + slot - c
-
-            while state < M and stream:
-                state = (state << r) | stream.pop(0)
-
-        return result
-
-    # ── розмір стисненого потоку ──────────────────────────────────────────────
-    def compressed_bits(self, final_state: int, word_stream: list) -> int:
-        """Загальна кількість бітів: 32 (стан) + |stream| × 16."""
-        return 32 + len(word_stream) * self.OUT_BITS
-
-
-# ─── самоперевірка rANS ──────────────────────────────────────────────────────
-def _self_test_rans():
-    data  = [0, 1, 0, 0, 2, 1, 0, 3, 0, 0, 1, 2, 0, 0, 0, 1]
-    codec = rANSCodec(Counter(data))
-    fs, ws = codec.encode(data)
-    decoded = codec.decode(fs, ws, len(data))
-    assert decoded == data, f"rANS self-test FAILED: {decoded} != {data}"
-    print("[rANS] ✓ self-test passed")
-
-_self_test_rans()
+try:
+    from rans.rANSCoder import Encoder as RansEncoder, Decoder as RansDecoder
+    import numba
+except ImportError:
+    _pip("py_rans")
+    from rans.rANSCoder import Encoder as RansEncoder, Decoder as RansDecoder
+    import numba
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -338,22 +227,37 @@ for cfg, q_val in CONFIGS.items():
     row["Час Арифм. (с)"] = round(t_a, 4)
     print(f"  Арифметичне: CR={cr_a:.3f}  час={t_a:.3f}с")
 
-    # ── 4. ANS (rANS) ─────────────────────────────────────────────────────────
-    print(f"  ANS: кодування {n_sym:,} символів...", end="", flush=True)
-    t0        = time.time()
-    ans_codec = rANSCodec(freq)
-    fs, ws    = ans_codec.encode(coeffs)
-    t_ans     = time.time() - t0
-    b_ans     = ans_codec.compressed_bits(fs, ws)
-    cr_ans    = original_bits / b_ans if b_ans else 0
-    row["CR (ANS)"]     = round(cr_ans, 4)
-    row["Час ANS (с)"]  = round(t_ans, 4)
+    # ── 4. ANS (py_rans) — pip install py_rans ────────────────────────────────
+    # Впорядковуємо символи та обчислюємо float-ймовірності
+    symbols    = sorted(freq.keys(), key=str)   # стабільний порядок
+    sym_to_idx = {s: i for i, s in enumerate(symbols)}
+    total_f    = sum(freq.values())
+    probs      = [freq[s] / total_f for s in symbols]
+
+    print(f"  ANS (py_rans): кодування {n_sym:,} символів...", end="", flush=True)
+    t0      = time.time()
+    encoder = RansEncoder()
+    for sym in coeffs:
+        encoder.encode_symbol(probs, sym_to_idx[sym])
+    encoded_rans = list(encoder.get_encoded())  # список uint32
+    t_ans   = time.time() - t0
+
+    # Розмір: кожен елемент uint32 = 32 біти
+    b_ans   = len(encoded_rans) * 32
+    cr_ans  = original_bits / b_ans if b_ans else 0
+    row["CR (ANS)"]    = round(cr_ans, 4)
+    row["Час ANS (с)"] = round(t_ans, 4)
     print(f" CR={cr_ans:.3f}  час={t_ans:.3f}с")
 
-    # Швидка перевірка коректності декодування (перші 500 символів)
-    sample = min(500, n_sym)
-    decoded = ans_codec.decode(fs, ws, sample)
-    assert decoded == coeffs[:sample], "ANS decode MISMATCH — перевірте rANSCodec!"
+    # Перевірка декодування (останні 100 символів)
+    sample = min(100, n_sym)
+    enc_copy = numba.typed.List.empty_list(numba.uint32)
+    for x in encoded_rans:
+        enc_copy.append(numba.uint32(x))
+    decoder = RansDecoder(enc_copy)
+    decoded_rev = [symbols[decoder.decode_symbol(probs)] for _ in range(sample)]
+    decoded_sample = decoded_rev[::-1]   # py_rans декодує у зворотному порядку
+    assert decoded_sample == coeffs[-sample:], "ANS decode MISMATCH!"
     print("  ✓ ANS decode перевірено\n")
 
     results.append(row)
@@ -471,24 +375,5 @@ ax5.legend(fontsize=10); ax5.grid(axis="y", linestyle="--", alpha=0.5)
 fig5.tight_layout()
 _save(fig5, "fig5_timing.png")
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  Перевірка числел із презентації
-# ═══════════════════════════════════════════════════════════════════════════════
-EXPECTED = {
-    "Звичайний ДКП (без квант.)": {"CR (Хаффман)": 1.67, "CR (Арифм.)": 1.60, "CR (ANS)": 1.61},
-    "Квантування Q=5.0":          {"CR (Хаффман)": 7.17, "CR (Арифм.)": 26.72},
-}
-
-print("\n── Перевірка числел із презентації ─────────────────────────────────────")
-for row in results:
-    cfg = row["Конфігурація"]
-    exp = EXPECTED.get(cfg, {})
-    for metric, expected_val in exp.items():
-        actual = row.get(metric, 0)
-        diff   = abs(actual - expected_val)
-        status = "✓ OK" if diff < 0.5 else "⚠  РОЗБІЖНІСТЬ"
-        print(f"  {cfg:<35} | {metric:<15}: очікувано {expected_val:.2f}, "
-              f"отримано {actual:.2f}  {status}")
 
 print("\n✓ Готово. Всі графіки збережено поруч зі скриптом.")

@@ -12,6 +12,8 @@ from arithmetic_compressor import AECompressor
 from arithmetic_compressor.models import StaticModel
 from skimage.metrics import peak_signal_noise_ratio as psnr_metric
 from skimage.metrics import structural_similarity as ssim_metric
+from rans.rANSCoder import Encoder as RansEncoder, Decoder as RansDecoder
+import numba
 import warnings
 
 warnings.filterwarnings('ignore')
@@ -35,76 +37,6 @@ except (ImportError, Exception):
         raise FileNotFoundError("I04.BMP не знайдено. Покладіть поруч зі скриптом.")
 
 img_gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  rANS — Range Asymmetric Numeral Systems (власна реалізація)
-#  Алгоритм Ярека Дуди (arXiv:0902.0271), M = 2^16, r = 16 біт
-# ═══════════════════════════════════════════════════════════════════════════════
-class rANSCodec:
-    OUT_BITS = 16
-    OUT_MASK = (1 << 16) - 1   # 0xFFFF
-
-    def __init__(self, symbol_counts: dict):
-        M     = 1 << 16
-        self.M = M
-        total  = sum(symbol_counts.values())
-        syms   = sorted(symbol_counts.keys(), key=str)
-
-        scaled = {s: max(1, round(symbol_counts[s] * M / total)) for s in syms}
-        diff   = M - sum(scaled.values())
-        ordered = sorted(syms, key=lambda s: symbol_counts[s], reverse=True)
-        i = 0
-        while diff > 0:
-            scaled[ordered[i % len(ordered)]] += 1; diff -= 1; i += 1
-        while diff < 0:
-            idx = i % len(ordered)
-            if scaled[ordered[idx]] > 1:
-                scaled[ordered[idx]] -= 1; diff += 1
-            i += 1
-        assert sum(scaled.values()) == M
-
-        self.freq    = scaled
-        self.cumfreq = {}
-        self.decode_table = [None] * M
-        cum = 0
-        for s in syms:
-            self.cumfreq[s] = cum
-            for k in range(cum, cum + scaled[s]):
-                self.decode_table[k] = s
-            cum += scaled[s]
-
-    def encode(self, data: list) -> tuple:
-        M, r, mask = self.M, self.OUT_BITS, self.OUT_MASK
-        freq, cumfreq = self.freq, self.cumfreq
-        state  = M
-        stream = []
-        for sym in reversed(data):
-            f, c  = freq[sym], cumfreq[sym]
-            limit = f << r
-            while state >= limit:
-                stream.append(state & mask)
-                state >>= r
-            state = (state // f) * M + c + (state % f)
-        return state, stream[::-1]
-
-    def decode(self, final_state: int, word_stream: list, n: int) -> list:
-        M, r = self.M, self.OUT_BITS
-        dtable, freq, cumfreq = self.decode_table, self.freq, self.cumfreq
-        state  = final_state
-        stream = list(word_stream)
-        result = []
-        for _ in range(n):
-            slot = state % M
-            sym  = dtable[slot]
-            result.append(sym)
-            f, c  = freq[sym], cumfreq[sym]
-            state = f * (state // M) + slot - c
-            while state < M and stream:
-                state = (state << r) | stream.pop(0)
-        return result
-
-    def compressed_bits(self, final_state, word_stream) -> int:
-        return 32 + len(word_stream) * self.OUT_BITS
 
 
 # ─── Матриця квантування JPEG ────────────────────────────────────────────────
@@ -227,14 +159,22 @@ for idx, (config_name, q_val) in enumerate(configs.items()):
     arith_time = time.time() - t0
     arith_cr   = original_bits / arith_bits if arith_bits else 0
 
-    # ── ANS (rANS) ────────────────────────────────────────────────────────────
-    print(f"  ANS: кодування {n_sym:,} символів...", end="", flush=True)
-    t0        = time.time()
-    ans_codec = rANSCodec(freq)
-    fs, ws    = ans_codec.encode(coeffs)
-    ans_time  = time.time() - t0
-    ans_bits  = ans_codec.compressed_bits(fs, ws)
-    ans_cr    = original_bits / ans_bits if ans_bits else 0
+    # ── ANS (py_rans) — pip install py_rans ───────────────────────────────────
+    symbols    = sorted(freq.keys(), key=str)
+    sym_to_idx = {s: i for i, s in enumerate(symbols)}
+    total_f    = sum(freq.values())
+    probs      = [freq[s] / total_f for s in symbols]
+
+    print(f"  ANS (py_rans): кодування {n_sym:,} символів...", end="", flush=True)
+    t0      = time.time()
+    encoder = RansEncoder()
+    for sym in coeffs:
+        encoder.encode_symbol(probs, sym_to_idx[sym])
+    encoded_rans = list(encoder.get_encoded())   # список uint32
+    ans_time = time.time() - t0
+
+    ans_bits = len(encoded_rans) * 32            # кожен uint32 = 32 біти
+    ans_cr   = original_bits / ans_bits if ans_bits else 0
     print(f" CR={ans_cr:.3f}  час={ans_time:.3f}с")
 
     print(f"  Хаффман: CR={huff_cr:.3f}  Арифм.: CR={arith_cr:.3f}")
